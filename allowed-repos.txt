@@ -1,0 +1,2 @@
+# Source repositories allowed to request a review, one owner/repo per line.
+BeyondScaleLabs/kdn

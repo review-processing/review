@@ -1,0 +1,496 @@
+#
+# Copyright (C) 2026 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# AI code review of a pull request of another repository. Dispatched by
+# review-processing/actions/.github/workflows/dispatch.yaml once the source repository has built
+# the PR checkout as artifacts (review-processing/actions/.github/workflows/pr.yaml).
+# The checkout is untrusted: it is never executed here, only mounted read-only into an
+# OpenShell sandbox where Claude reviews it. The result is posted as a sticky PR comment.
+#
+# Who gets a review (PR author with write access, or a maintainer's /ok-to-review <sha>) is decided
+# by dispatch.yaml in the source repository, not re-checked here: anyone able to dispatch this
+# workflow can request a review of any open PR of an allowed repository. The other inputs are
+# re-validated against the source repository's API, and the repository must be in allowed-repos.txt.
+#
+# Jobs:
+#   validate - allowlist, PR/run consistency                              (no PR code)
+#   review   - run Claude in the sandbox                                    (GCP token, no GitHub write)
+#   report   - upsert the PR comment                                        (source token, no PR code)
+#
+# Secrets: REVIEW_SOURCE_TOKEN, fine-grained PAT on the allowed repositories with Actions read,
+# Issues write and Pull requests read; its owner needs no write role on them (org membership is
+# enough to issue the token).
+# Comments are posted as that owner. REVIEW_GCP_WIF_PROVIDER, REVIEW_GCP_PROJECT_ID; vars REVIEW_GCP_REGION,
+# REVIEW_RULES (reviewer rules, appended to the system prompt).
+#
+# Required on the GCP side: restrict the WIF provider with an attribute condition, e.g.:
+#   assertion.repository == 'review-processing/review' && assertion.ref == 'refs/heads/main'
+#   && assertion.workflow_ref.startsWith('review-processing/review/.github/workflows/review.yaml@')
+# The principal only needs roles/aiplatform.user.
+#
+# The review is advisory: it must not gate merges.
+
+name: review
+run-name: review ${{ inputs.repo }}#${{ inputs.pr_number }} ${{ inputs.head_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Source repository (owner/name)
+        required: true
+      run_id:
+        description: Id of the source repository's codereview-pr run holding the review-src artifact
+        required: true
+      pr_number:
+        description: Pull request number
+        required: true
+      head_sha:
+        description: Full head commit sha of the pull request
+        required: true
+
+concurrency:
+  # One review per PR: a new commit cancels the review of the previous one.
+  group: review-${{ inputs.repo }}-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  OPENSHELL_VERSION: '0.1.4'
+  # openshell_0.1.4-1_arm64.deb from openshell-checksums-sha256.txt of the v0.1.4 release
+  OPENSHELL_DEB_SHA256: 803939a059db6cc2a1ab38ff49e5c57e41b42549ac555130f13749d8ed6f46fb
+  # providers/google-vertex-ai.yaml at the v0.1.4 tag commit (pinned by sha, verified by hash)
+  OPENSHELL_PROFILE_URL: https://raw.githubusercontent.com/NVIDIA/OpenShell/5a7728c304b5528e954e9ae900cf21f84e1a12b1/providers/google-vertex-ai.yaml
+  OPENSHELL_PROFILE_SHA256: 96c5006fcbf7d6ec8f83dc75fad35f6ae1213573db14543ab06b570ddc9edaeb
+  # Built from review-processing/openshell-image. The review job runs on an arm runner.
+  # tag 12c5a8e9c2c6bc079755451f2e0b3b1bdffe4286 (also next at the time of pinning)
+  SANDBOX_IMAGE: ghcr.io/review-processing/openshell-image:12c5a8e9c2c6bc079755451f2e0b3b1bdffe4286@sha256:b22d18ec742d872a83a2259888b5c5414a8438ebb5e64ff8423dc61b411dd34a
+  REVIEW_MODEL: claude-opus-4-6
+  REVIEW_TIMEOUT_SECS: 900
+  # Path of the source repository's workflow calling review-processing/actions pr.yaml.
+  PR_WORKFLOW_PATH: .github/workflows/codereview-pr.yaml
+
+jobs:
+  validate:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+    steps:
+      - name: Checkout allowlist
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: allowed-repos.txt
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate inputs
+        id: authorize
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_SOURCE_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          RUN_ID: ${{ inputs.run_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -euo pipefail
+          deny() { echo "::notice::$1"; echo "authorized=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$RUN_ID" =~ ^[0-9]+$ \
+            && "$PR_NUMBER" =~ ^[0-9]+$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || deny "Malformed inputs"
+          grep -qxF "$REPO" allowed-repos.txt || deny "$REPO is not in allowed-repos.txt"
+
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          [[ "$(jq -r '.head.sha' <<< "$pr")" == "$HEAD_SHA" ]] || deny "$REPO#$PR_NUMBER head is not $HEAD_SHA (outdated or forged)"
+          [[ "$(jq -r '.state' <<< "$pr")" == open ]] || deny "$REPO#$PR_NUMBER is not open"
+
+          run=$(gh api "repos/$REPO/actions/runs/$RUN_ID")
+          jq -e --arg sha "$HEAD_SHA" --arg path "$PR_WORKFLOW_PATH" \
+            '.head_sha == $sha and .event == "pull_request" and .conclusion == "success" and (.path | startswith($path))' \
+            <<< "$run" >/dev/null || deny "Run $RUN_ID is not a successful $PR_WORKFLOW_PATH run of $HEAD_SHA"
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: validate
+    if: ${{ needs.validate.outputs.authorized == 'true' }}
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      REPO: ${{ inputs.repo }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      SRC_DIR: ${{ github.workspace }}/review-src
+      # Logs and raw outputs uploaded as the review-artifacts artifact (public: this repository is public).
+      ART_DIR: ${{ github.workspace }}/review-artifacts
+    steps:
+      - name: Checkout trusted review files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          sparse-checkout: codereview
+          persist-credentials: false
+
+      - name: Download PR checkout
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          repository: ${{ inputs.repo }}
+          run-id: ${{ inputs.run_id }}
+          name: review-src
+          path: ${{ runner.temp }}/dl
+          github-token: ${{ secrets.REVIEW_SOURCE_TOKEN }}
+
+      # Untrusted content: extracted, never executed on this host, only bind-mounted read-only.
+      - name: Extract PR checkout
+        run: |
+          set -euo pipefail
+          mkdir -p "$SRC_DIR"
+          tar --no-same-owner --no-same-permissions -xzf "$RUNNER_TEMP/dl/review-src.tgz" -C "$SRC_DIR"
+          rm -rf "$RUNNER_TEMP/dl"
+
+      - name: Install OpenShell
+        run: |
+          set -euo pipefail
+          deb="openshell_${OPENSHELL_VERSION}-1_arm64.deb"
+          curl -fsSL -o "$RUNNER_TEMP/$deb" "https://github.com/NVIDIA/OpenShell/releases/download/v${OPENSHELL_VERSION}/$deb"
+          echo "$OPENSHELL_DEB_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
+          sudo apt-get install -y "$RUNNER_TEMP/$deb"
+          openshell --version || true
+
+      # Bind mounts need driver config allowed and resource admission off (OpenShell docs: Podman Mounts).
+      - name: Start OpenShell gateway with the Podman driver
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/openshell
+          cat > ~/.config/openshell/gateway.toml <<'EOF'
+          [openshell]
+          version = 2
+
+          [openshell.gateway]
+          compute_driver = "podman"
+
+          [openshell.drivers.podman]
+          image_pull_policy = "if_not_present"
+          allow_driver_config = true
+          enable_bind_mounts = true
+
+          [openshell.drivers.podman.resource_admission]
+          enabled = false
+          EOF
+          # Podman ships with the runner image. A lingering user manager provides XDG_RUNTIME_DIR
+          # and `systemctl --user` for podman.socket and the gateway service.
+          sudo loginctl enable-linger "$USER"
+          runtime_dir="/run/user/$(id -u)"
+          for _ in $(seq 30); do [[ -S "$runtime_dir/bus" ]] && break; sleep 1; done
+          export XDG_RUNTIME_DIR="$runtime_dir" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+          {
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+            echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+          } >> "$GITHUB_ENV"
+          podman version --format 'Podman {{.Client.Version}}'
+          systemctl --user daemon-reload
+          systemctl --user enable --now podman.socket
+          systemctl --user enable --now openshell-gateway
+          # `gateway add --local` imports the mTLS bundle once the service has generated it.
+          added=false
+          for _ in $(seq 60); do
+            if [[ "$added" == false ]] && openshell gateway add https://127.0.0.1:17670 --local --name openshell; then
+              added=true
+            fi
+            if [[ "$added" == true ]] && openshell status 2>/dev/null | grep -q 'Version:'; then
+              openshell status
+              exit 0
+            fi
+            sleep 2
+          done
+          systemctl --user status openshell-gateway --no-pager || true
+          journalctl --user -u openshell-gateway --no-pager | tail -n 100 || true
+          exit 1
+
+      - name: Pull sandbox image
+        run: podman pull "$SANDBOX_IMAGE"
+
+      # Direct WIF. The external_account file it writes (workspace root, never mounted or uploaded) is used by
+      # vertex-token.sh to mint fresh tokens: the federated token lives only as long as GitHub's OIDC token (~5 min).
+      - name: Authenticate to GCP via WIF
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ secrets.REVIEW_GCP_WIF_PROVIDER }}
+          project_id: ${{ secrets.REVIEW_GCP_PROJECT_ID }}
+
+      # Only the gateway holds the token; the sandbox gets a placeholder that the gateway proxy
+      # resolves on egress to the Vertex hosts, and only for the claude binary (see profile).
+      - name: Register Vertex AI provider
+        env:
+          VERTEX_PROJECT: ${{ secrets.REVIEW_GCP_PROJECT_ID }}
+          VERTEX_REGION: ${{ vars.REVIEW_GCP_REGION }}
+        run: |
+          set -euo pipefail
+          GOOGLE_VERTEX_AI_TOKEN=$(bash trusted/codereview/vertex-token.sh "$GOOGLE_APPLICATION_CREDENTIALS")
+          echo "::add-mask::$GOOGLE_VERTEX_AI_TOKEN"
+          export GOOGLE_VERTEX_AI_TOKEN
+          profile="$RUNNER_TEMP/review-google-vertex-ai.yaml"
+          curl -fsSL -o "$RUNNER_TEMP/google-vertex-ai.yaml" "$OPENSHELL_PROFILE_URL"
+          echo "$OPENSHELL_PROFILE_SHA256  $RUNNER_TEMP/google-vertex-ai.yaml" | sha256sum -c -
+          # Only the image's claude CLI may use the Vertex token. Keep the upstream id: OpenShell's
+          # Vertex plugin is keyed on type "google-vertex-ai" and is what projects
+          # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ... into the sandbox.
+          # The runner refreshes GOOGLE_VERTEX_AI_TOKEN itself (see Run review), so drop the gateway refresh and use a
+          # stable placeholder: otherwise the long-running claude process keeps resolving the first (expired) token.
+          yq '.display_name = "Google Vertex AI (code review)"
+              | .binaries = ["/usr/local/bin/claude"]
+              | (.credentials[] | select(.name == "gcloud_adc_token")) |= (del(.refresh) | .stable_placeholder = true)' \
+            "$RUNNER_TEMP/google-vertex-ai.yaml" > "$profile"
+          openshell provider profile lint -f "$profile"
+          openshell provider profile import -f "$profile" --global
+          openshell provider create --name vertex --type google-vertex-ai --global-profile \
+            --credential GOOGLE_VERTEX_AI_TOKEN \
+            --config "VERTEX_AI_PROJECT_ID=$VERTEX_PROJECT" \
+            --config "VERTEX_AI_REGION=$VERTEX_REGION"
+
+      - name: Create sandbox
+        id: sandbox
+        run: |
+          set -euo pipefail
+          name="review-${PR_NUMBER}-${HEAD_SHA:0:7}"
+          mounts=$(jq -cn --arg src "$SRC_DIR" \
+            '{podman: {mounts: [{type: "bind", source: $src, target: "/sandbox/src", read_only: true}]}}')
+          openshell sandbox create --name "$name" --from "$SANDBOX_IMAGE" \
+            --provider vertex --no-auto-providers --detach --no-tty \
+            --driver-config-json "$mounts"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # Claude runs outside the PR tree with project settings, hooks, CLAUDE.md discovery and MCP
+      # disabled, so files in the PR cannot configure it. Egress is limited to the Vertex hosts.
+      - name: Run review
+        id: run
+        env:
+          SANDBOX: ${{ steps.sandbox.outputs.name }}
+          REVIEW_RULES: ${{ vars.REVIEW_RULES }}
+        run: |
+          set -uo pipefail
+          [[ -n "$REVIEW_RULES" ]] || { echo "::error::REVIEW_RULES variable is empty"; exit 1; }
+          set +e # GitHub runs this with bash -e: keep going to record the exit code
+          mkdir -p "$ART_DIR"
+          start=$(date +%s)
+          # Live view of the agent. The stream is shaped by PR content, so workflow commands are disabled
+          # with a token generated here, which never enters the sandbox.
+          stop_token=$(openssl rand -hex 16)
+          echo "::group::Review agent (live)"
+          echo "::stop-commands::$stop_token"
+          # GitHub OIDC (hence the federated Vertex token) lives ~5 min: push a fresh token to the gateway every 3 min.
+          # The gateway updates the sandbox proxy's resolver; the sandbox only ever sees the placeholder.
+          (
+            while sleep 180; do
+              if t=$(bash trusted/codereview/vertex-token.sh "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null) \
+                && GOOGLE_VERTEX_AI_TOKEN="$t" openshell provider update vertex --credential GOOGLE_VERTEX_AI_TOKEN --wait --timeout 60 >/dev/null 2>&1; then
+                echo "🔑 Vertex token refreshed"
+              else
+                echo "⚠️ Vertex token refresh failed"
+              fi
+            done
+          ) &
+          refresher=$!
+          # shellcheck disable=SC2016 # the inner script expands inside the sandbox, not here
+          timeout --kill-after=30 "$((REVIEW_TIMEOUT_SECS + 60))" \
+            openshell sandbox exec -n "$SANDBOX" --timeout "$REVIEW_TIMEOUT_SECS" --no-tty \
+              --env CLAUDE_CODE_USE_VERTEX=1 \
+              --env CLAUDE_CODE_SKIP_VERTEX_AUTH=1 \
+              --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+              -- sh -c '
+                # Claude sends ANTHROPIC_AUTH_TOKEN as "Authorization: Bearer"; its value is the provider placeholder,
+                # which the OpenShell proxy replaces with the real token on the way to Vertex.
+                export ANTHROPIC_AUTH_TOKEN="${GOOGLE_VERTEX_AI_TOKEN:?Vertex provider token not injected}"
+                # The checkout is owned by another uid inside the sandbox; trust it so git does not refuse it ("dubious ownership").
+                printf "[safe]\n\tdirectory = /sandbox/src\n" > /tmp/gitconfig
+                export GIT_CONFIG_GLOBAL=/tmp/gitconfig
+                mkdir -p /tmp/work && cd /tmp/work || exit 1
+                exec claude -p "$1" --append-system-prompt "$2" --model "$3" \
+                  --bare --setting-sources user --strict-mcp-config --no-session-persistence \
+                  --add-dir /sandbox/src \
+                  --permission-mode dontAsk \
+                  --allowedTools "Read,Grep,Glob,Bash,Write(//tmp/review-output.json)" \
+                  --disallowedTools "WebFetch,WebSearch" \
+                  --output-format stream-json --verbose
+              ' sh \
+              "$(cat trusted/codereview/task.md)" \
+              "$REVIEW_RULES" \
+              "$REVIEW_MODEL" \
+            2> "$ART_DIR/claude-stderr.txt" \
+            | tee "$ART_DIR/claude-output.jsonl" \
+            | jq -R -r --unbuffered -f trusted/codereview/stream.jq
+          code=${PIPESTATUS[0]}
+          kill "$refresher" 2>/dev/null || true
+          echo "::$stop_token::"
+          echo "::endgroup::"
+          duration=$(( $(date +%s) - start ))
+          echo "Review exited with $code after ${duration}s"
+          timed_out=false
+          if (( code == 124 || duration >= REVIEW_TIMEOUT_SECS )); then timed_out=true; fi
+          {
+            echo "durationS=$duration"
+            echo "timedOut=$timed_out"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Collect review output and sandbox logs, delete sandbox
+        if: ${{ always() && steps.sandbox.outputs.name }}
+        env:
+          SANDBOX: ${{ steps.sandbox.outputs.name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out" "$ART_DIR"
+          # `sandbox download` only accepts paths under the sandbox workspace, not /tmp: read it over exec instead.
+          # Capped at 1 MB + 1 byte so the validation step can reject oversized output.
+          out="$RUNNER_TEMP/out/review-output.json"
+          if openshell sandbox exec -n "$SANDBOX" --no-tty -- cat /tmp/review-output.json 2>/dev/null \
+              | head -c 1048577 > "$out" && [[ -s "$out" ]]; then
+            cp "$out" "$ART_DIR/review-output.json"
+          else
+            rm -f "$out"
+            echo "::warning::No /tmp/review-output.json in the sandbox"
+          fi
+          openshell logs "$SANDBOX" -n 100000 > "$ART_DIR/sandbox.log" 2>&1 || true
+          for id in $(podman ps -aq --filter label=openshell.managed=true); do
+            podman logs "$id" > "$ART_DIR/container-$id.log" 2>&1 || true
+          done
+          openshell sandbox delete "$SANDBOX" || true
+
+      - name: Collect gateway logs
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$ART_DIR"
+          journalctl --user -u openshell-gateway --no-pager > "$ART_DIR/gateway.log" 2>&1 || true
+
+      # The output is model-written and the model read attacker-controlled content: validate it
+      # strictly, fall back to REQUEST_CHANGES, and take PR number/sha from trusted metadata only.
+      - name: Validate review output
+        if: ${{ always() }}
+        env:
+          DURATION_S: ${{ steps.run.outputs.durationS || 0 }}
+          TIMED_OUT: ${{ steps.run.outputs.timedOut || 'false' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          out=$(find "$RUNNER_TEMP/out" -type f -name review-output.json 2>/dev/null | head -n1 || true)
+          failed=true
+          review='{"status":"REQUEST_CHANGES","comments":"Automated review failed or timed out before producing a valid result. See the run logs."}'
+          if [[ -n "$out" ]] && (( $(stat -c %s "$out") <= 1048576 )) \
+            && jq -e '(.status | IN("ACCEPT", "ACCEPT_WITH_NITS", "REQUEST_CHANGES")) and (.comments | type == "string")' "$out" >/dev/null 2>&1; then
+            review=$(jq -c '{status, comments}' "$out")
+            failed=false
+          fi
+          # Cost and token usage computed by the Claude CLI (absent when the run timed out).
+          usage=$(jq -R -c 'fromjson? | select(.type == "result") | {
+              cost_usd: (.total_cost_usd | numbers),
+              num_turns: (.num_turns | numbers),
+              input_tokens: (.usage.input_tokens | numbers),
+              output_tokens: (.usage.output_tokens | numbers),
+              cache_read_tokens: (.usage.cache_read_input_tokens // 0 | numbers),
+              cache_write_tokens: (.usage.cache_creation_input_tokens // 0 | numbers)
+            }' "$ART_DIR/claude-output.jsonl" 2>/dev/null | tail -n1 || true)
+          [[ -n "$usage" ]] || usage=null
+          jq -rn --argjson u "$usage" 'if $u then "Estimated cost: $\($u.cost_usd) (\($u.num_turns) turns)" else "Estimated cost: n/a" end'
+
+          mkdir -p "$RUNNER_TEMP/result"
+          jq -n --argjson review "$review" --argjson usage "$usage" --argjson pr_number "$PR_NUMBER" --arg head_sha "$HEAD_SHA" \
+            --arg model "$REVIEW_MODEL" --argjson duration_s "$DURATION_S" --argjson timed_out "$TIMED_OUT" \
+            --argjson failed "$failed" --arg run_url "$RUN_URL" \
+            '$review + {pr_number: $pr_number, head_sha: $head_sha, model: $model, duration_s: $duration_s,
+                        timed_out: $timed_out, failed: $failed, run_url: $run_url, usage: $usage}' \
+            > "$RUNNER_TEMP/result/review-result.json"
+          mkdir -p "$ART_DIR"
+          cp "$RUNNER_TEMP/result/review-result.json" "$ART_DIR/"
+
+          # Model text must not be interpreted as workflow commands.
+          stop_token=$(openssl rand -hex 16)
+          echo "Review result for PR #$PR_NUMBER (${HEAD_SHA:0:7}):"
+          echo "::stop-commands::$stop_token"
+          cat "$RUNNER_TEMP/result/review-result.json"
+          echo "::$stop_token::"
+
+      - name: Upload review result
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-result
+          path: ${{ runner.temp }}/result/review-result.json
+
+      - name: Upload review artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-artifacts
+          path: ${{ env.ART_DIR }}
+          if-no-files-found: ignore
+
+  report:
+    needs: [validate, review]
+    if: ${{ always() && needs.validate.outputs.authorized == 'true' && needs.review.result != 'cancelled' }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    env:
+      REPO: ${{ inputs.repo }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout trusted scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: codereview
+          persist-credentials: false
+
+      - name: Download review result
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: review-result
+          path: ${{ runner.temp }}/result
+
+      - name: Render comment
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/result/review-result.json"
+          if [[ ! -f "$result" ]]; then
+            # review job crashed or hit its job timeout
+            mkdir -p "$RUNNER_TEMP/result"
+            jq -n --argjson pr_number "$PR_NUMBER" --arg head_sha "$HEAD_SHA" --arg model "$REVIEW_MODEL" --arg run_url "$RUN_URL" \
+              '{status: "REQUEST_CHANGES", comments: "Automated review job did not complete. See the run logs.",
+                pr_number: $pr_number, head_sha: $head_sha, model: $model, duration_s: 0,
+                timed_out: false, failed: true, run_url: $run_url}' > "$result"
+          fi
+          bash codereview/render-comment.sh "$result" > "$RUNNER_TEMP/comment.md"
+
+      # One sticky comment per PR, owned by the REVIEW_SOURCE_TOKEN user, updated on each review.
+      - name: Comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          body=$(jq -Rs '{body: .}' "$RUNNER_TEMP/comment.md")
+          me=$(gh api user --jq '.login')
+          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            | jq -r --arg me "$me" '.[] | select(.user.login == $me and (.body | startswith("<!-- ai-code-review -->"))) | .id' | head -n1)
+          if [[ -n "$existing" ]]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input - <<< "$body" --jq '.html_url'
+          else
+            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - <<< "$body" --jq '.html_url'
+          fi
