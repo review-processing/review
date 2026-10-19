@@ -24,6 +24,6 @@ When done, write `/tmp/review-output.json` with exactly this shape:
 ```
 
 - `status`: **Approve** maps to `ACCEPT`, **Approve with nits** to `ACCEPT_WITH_NITS`, and **Request changes** to `REQUEST_CHANGES`.
-- `comments`: the findings, one per line, as `path:LINE — issue|nit|question: ...`. Then the verdict with the blocking items, then the checks you could not perform. Write it as a markdown string, JSON-escaped.
+- `comments`: the review written exactly in the output format the reviewer rules in your system prompt define (first line, headings, blockquote, sections, verdict, blocking list, unverified checks). Leave out any outer code fence those rules ask for: `comments` is already the raw markdown of the comment. JSON-escape it.
 
 Write the file even if you could not finish the review. In that case use `REQUEST_CHANGES` and explain why.
