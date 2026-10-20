@@ -80,7 +80,7 @@ env:
   # Built from review-processing/openshell-image. The review job runs on an arm runner.
   # tag 12c5a8e9c2c6bc079755451f2e0b3b1bdffe4286 (also next at the time of pinning)
   SANDBOX_IMAGE: ghcr.io/review-processing/openshell-image:12c5a8e9c2c6bc079755451f2e0b3b1bdffe4286@sha256:b22d18ec742d872a83a2259888b5c5414a8438ebb5e64ff8423dc61b411dd34a
-  REVIEW_MODEL: claude-opus-4-6
+  REVIEW_MODEL: claude-opus-5-5
   REVIEW_TIMEOUT_SECS: 900
   # Path of the source repository's workflow calling review-processing/actions pr.yaml.
   PR_WORKFLOW_PATH: .github/workflows/codereview-pr.yaml
