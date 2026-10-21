@@ -24,18 +24,18 @@
 # Who gets a review (PR author with write access, or a maintainer's /ok-to-review <sha>) is decided
 # by dispatch.yaml in the source repository, not re-checked here: anyone able to dispatch this
 # workflow can request a review of any open PR of an allowed repository. The other inputs are
-# re-validated against the source repository's API, and the repository must be in allowed-repos.txt.
+# re-validated against the source repository's API, and the repository must be in repos.yaml.
 #
 # Jobs:
 #   validate - allowlist, PR/run consistency                              (no PR code)
 #   review   - run Claude in the sandbox                                    (GCP token, no GitHub write)
 #   report   - upsert the PR comment                                        (source token, no PR code)
 #
-# Secrets: REVIEW_SOURCE_TOKEN, fine-grained PAT on the allowed repositories with Actions read,
-# Issues write and Pull requests read; its owner needs no write role on them (org membership is
-# enough to issue the token).
-# Comments are posted as that owner. REVIEW_GCP_WIF_PROVIDER, REVIEW_GCP_PROJECT_ID; vars REVIEW_GCP_REGION,
-# REVIEW_RULES (reviewer rules, appended to the system prompt).
+# Secrets: REVIEW_SOURCE_TOKEN, classic PAT with the public_repo scope (repo for a private source
+# repository), so one token covers allowed repositories of several owners; its owner needs no write
+# role on them. Comments are posted as that owner. REVIEW_GCP_WIF_PROVIDER, REVIEW_GCP_PROJECT_ID;
+# vars REVIEW_GCP_REGION, REVIEW_RULES (reviewer rules appended to the system prompt, used when
+# repos.yaml lists no rules files for the repository).
 #
 # Required on the GCP side: restrict the WIF provider with an attribute condition, e.g.:
 #   assertion.repository == 'review-processing/review' && assertion.ref == 'refs/heads/main'
@@ -96,7 +96,7 @@ jobs:
       - name: Checkout allowlist
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: allowed-repos.txt
+          sparse-checkout: repos.yaml
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -113,7 +113,7 @@ jobs:
           deny() { echo "::notice::$1"; echo "authorized=false" >> "$GITHUB_OUTPUT"; exit 0; }
           [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$RUN_ID" =~ ^[0-9]+$ \
             && "$PR_NUMBER" =~ ^[0-9]+$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || deny "Malformed inputs"
-          grep -qxF "$REPO" allowed-repos.txt || deny "$REPO is not in allowed-repos.txt"
+          REPO="$REPO" yq -e '.repositories | has(strenv(REPO))' repos.yaml >/dev/null || deny "$REPO is not in repos.yaml"
 
           pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
           [[ "$(jq -r '.head.sha' <<< "$pr")" == "$HEAD_SHA" ]] || deny "$REPO#$PR_NUMBER head is not $HEAD_SHA (outdated or forged)"
@@ -278,16 +278,39 @@ jobs:
             --driver-config-json "$mounts"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
+      # Rules come from the source repository's default branch, never from the PR checkout,
+      # so a PR cannot rewrite the rules it is reviewed with.
+      - name: Fetch reviewer rules
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_SOURCE_TOKEN }}
+          REVIEW_RULES: ${{ vars.REVIEW_RULES }}
+        run: |
+          set -euo pipefail
+          rules="$RUNNER_TEMP/rules.md"
+          mapfile -t paths < <(yq -r '.repositories[strenv(REPO)].rules // [] | .[]' trusted/repos.yaml)
+          if (( ${#paths[@]} == 0 )); then
+            [[ -n "$REVIEW_RULES" ]] || { echo "::error::No rules in repos.yaml for $REPO and REVIEW_RULES is empty"; exit 1; }
+            printf '%s\n' "$REVIEW_RULES" > "$rules"
+          else
+            branch=$(gh api "repos/$REPO" --jq .default_branch)
+            : > "$rules"
+            for p in "${paths[@]}"; do
+              gh api -H 'Accept: application/vnd.github.raw' "repos/$REPO/contents/$p?ref=$branch" >> "$rules"
+              printf '\n\n' >> "$rules"
+            done
+          fi
+          mkdir -p "$ART_DIR"
+          cp "$rules" "$ART_DIR/"
+
       # Claude runs outside the PR tree with project settings, hooks, CLAUDE.md discovery and MCP
       # disabled, so files in the PR cannot configure it. Egress is limited to the Vertex hosts.
+      # ponytail: rules are passed as one argument (Linux caps it at 128 KB); mount a file if they outgrow it.
       - name: Run review
         id: run
         env:
           SANDBOX: ${{ steps.sandbox.outputs.name }}
-          REVIEW_RULES: ${{ vars.REVIEW_RULES }}
         run: |
           set -uo pipefail
-          [[ -n "$REVIEW_RULES" ]] || { echo "::error::REVIEW_RULES variable is empty"; exit 1; }
           set +e # GitHub runs this with bash -e: keep going to record the exit code
           mkdir -p "$ART_DIR"
           start=$(date +%s)
@@ -332,7 +355,7 @@ jobs:
                   --output-format stream-json --verbose
               ' sh \
               "$(cat trusted/codereview/task.md)" \
-              "$REVIEW_RULES" \
+              "$(cat "$RUNNER_TEMP/rules.md")" \
               "$REVIEW_MODEL" \
             2> "$ART_DIR/claude-stderr.txt" \
             | tee "$ART_DIR/claude-output.jsonl" \

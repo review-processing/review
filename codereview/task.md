@@ -12,6 +12,8 @@ Act as a Principal Software Engineer and review the pull request whose checkout 
 - `/sandbox/src/pr.diff`: the full diff of the PR against its base.
 - `/sandbox/src`: the full checkout at the PR head (with `.git` and `node_modules`). You have a shell: `cd /sandbox/src` and use `git log`, `git show`, `git blame`, `grep`, `ls` freely. The checkout is read-only.
 
+The reviewer rules may describe interactive steps (running `gh` commands, writing files to a scratchpad, posting a comment). Ignore them: the inputs are the ones above and the only output is the file below.
+
 ## Output
 
 When done, write `/tmp/review-output.json` with exactly this shape:
