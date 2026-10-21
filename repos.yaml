@@ -3,6 +3,7 @@
 #        rules (appended to the system prompt). Without it, the REVIEW_RULES variable is used.
 repositories:
   BeyondScaleLabs/kdn: {}
+  openkaiden/kaiden: {}
   benoitf/podman-desktop:
     rules:
       - .agents/skills/review-podman-desktop/references/procedure.md
