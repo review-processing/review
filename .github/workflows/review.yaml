@@ -304,7 +304,6 @@ jobs:
 
       # Claude runs outside the PR tree with project settings, hooks, CLAUDE.md discovery and MCP
       # disabled, so files in the PR cannot configure it. Egress is limited to the Vertex hosts.
-      # ponytail: rules are passed as one argument (Linux caps it at 128 KB); mount a file if they outgrow it.
       - name: Run review
         id: run
         env:
