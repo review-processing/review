@@ -302,6 +302,17 @@ jobs:
           mkdir -p "$ART_DIR"
           cp "$rules" "$ART_DIR/"
 
+      # meta.json carries the title and body from the push event, so edits made after the push
+      # would be missed. Refresh them right before the review starts.
+      - name: Refresh PR title and body
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '{title, body: (.body // "")}' > "$RUNNER_TEMP/pr.json"
+          jq --slurpfile pr "$RUNNER_TEMP/pr.json" '. + $pr[0]' "$SRC_DIR/meta.json" > "$RUNNER_TEMP/meta.json"
+          mv "$RUNNER_TEMP/meta.json" "$SRC_DIR/meta.json"
+
       # Claude runs outside the PR tree with project settings, hooks, CLAUDE.md discovery and MCP
       # disabled, so files in the PR cannot configure it. Egress is limited to the Vertex hosts.
       - name: Run review
