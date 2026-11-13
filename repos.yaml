@@ -1,6 +1,7 @@
 # Source repositories allowed to request a review.
 # rules: files of the source repository's default branch, concatenated in order as the reviewer
 #        rules (appended to the system prompt). Without it, the REVIEW_RULES variable is used.
+# comment: sticky (default) edits the previous review comment; new posts a new comment per review.
 repositories:
   podman-desktop/podman-desktop:
     rules:
@@ -8,7 +9,8 @@ repositories:
       - .agents/skills/review-podman-desktop/references/rules.md
       - .agents/skills/review-podman-desktop/references/output-comment.md
   BeyondScaleLabs/kdn: {}
-  openkaiden/kaiden: {}
+  openkaiden/kaiden:
+    comment: new
   benoitf/podman-desktop:
     rules:
       - .agents/skills/review-podman-desktop/references/procedure.md

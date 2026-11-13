@@ -19,7 +19,8 @@
 # review-processing/actions/.github/workflows/dispatch.yaml once the source repository has built
 # the PR checkout as artifacts (review-processing/actions/.github/workflows/pr.yaml).
 # The checkout is untrusted: it is never executed here, only mounted read-only into an
-# OpenShell sandbox where Claude reviews it. The result is posted as a sticky PR comment.
+# OpenShell sandbox where Claude reviews it. The result is posted as a PR comment, edited on each review
+# unless repos.yaml sets comment: new for the repository.
 #
 # Who gets a review (PR author with write access, or a maintainer's /ok-to-review <sha>) is decided
 # by dispatch.yaml in the source repository, not re-checked here: anyone able to dispatch this
@@ -488,7 +489,9 @@ jobs:
       - name: Checkout trusted scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          sparse-checkout: codereview
+          sparse-checkout: |
+            codereview
+            repos.yaml
           persist-credentials: false
 
       - name: Download review result
@@ -512,7 +515,8 @@ jobs:
           fi
           bash codereview/render-comment.sh "$result" > "$RUNNER_TEMP/comment.md"
 
-      # One sticky comment per PR, owned by the REVIEW_SOURCE_TOKEN user, updated on each review.
+      # Comment owned by the REVIEW_SOURCE_TOKEN user: one per PR, updated on each review (comment: sticky,
+      # the default), or one per review (comment: new in repos.yaml).
       - name: Comment on PR
         env:
           GH_TOKEN: ${{ secrets.REVIEW_SOURCE_TOKEN }}
@@ -520,8 +524,11 @@ jobs:
           set -euo pipefail
           body=$(jq -Rs '{body: .}' "$RUNNER_TEMP/comment.md")
           me=$(gh api user --jq '.login')
-          existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-            | jq -r --arg me "$me" '.[] | select(.user.login == $me and (.body | startswith("<!-- ai-code-review -->"))) | .id' | head -n1)
+          existing=""
+          if [[ "$(yq -r '.repositories[strenv(REPO)].comment // "sticky"' repos.yaml)" == sticky ]]; then
+            existing=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+              | jq -r --arg me "$me" '.[] | select(.user.login == $me and (.body | startswith("<!-- ai-code-review -->"))) | .id' | head -n1)
+          fi
           if [[ -n "$existing" ]]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$existing" --input - <<< "$body" --jq '.html_url'
           else
